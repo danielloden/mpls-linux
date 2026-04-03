@@ -9,6 +9,8 @@
 #include <linux/if_ether.h>
 #include <linux/netdevice.h>
 #include <linux/mpls.h>
+#include <linux/skbuff.h>
+#include <linux/module.h>
 
 #define MPLS_HLEN 4
 
@@ -41,5 +43,20 @@ static inline struct mpls_shim_hdr mpls_entry_encode(u32 label,
 			    (ttl << MPLS_LS_TTL_SHIFT));
 	return result;
 }
+
+struct mpls_local_input_ops {
+	int (*input)(struct sk_buff *skb, struct net_device *ingress_dev,
+		     void *priv);
+	void (*release)(void *priv);
+	struct module *owner;
+};
+
+int mpls_local_pw_register(struct net *net, u32 in_label,
+			   const struct mpls_local_input_ops *ops,
+			   void *priv);
+
+void mpls_local_pw_unregister(struct net *net, u32 in_label,
+			      const struct mpls_local_input_ops *ops,
+			      void *priv);
 
 #endif

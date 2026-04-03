@@ -8,6 +8,13 @@
  */
 #define MAX_NEW_LABELS 30
 
+enum mpls_route_action {
+	MPLS_ROUTE_ACT_NH = 0,
+	MPLS_ROUTE_ACT_LOCAL_PW,
+};
+
+struct mpls_local_input_ops;
+
 struct mpls_entry_decoded {
 	u32 label;
 	u8 ttl;
@@ -155,6 +162,12 @@ struct mpls_route { /* next hop label forwarding entry */
 	u8			rt_nh_size;
 	u8			rt_via_offset;
 	u8			rt_reserved1;
+	u8			rt_action;
+	u16			rt_reserved2;
+
+	const struct mpls_local_input_ops *rt_local_ops;
+	void			*rt_local_priv;
+
 	struct mpls_nh		rt_nh[];
 };
 

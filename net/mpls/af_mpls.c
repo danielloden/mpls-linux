@@ -12,6 +12,7 @@
 #include <linux/nospec.h>
 #include <linux/vmalloc.h>
 #include <linux/percpu.h>
+#include <net/mpls.h>
 #include <net/gso.h>
 #include <net/ip.h>
 #include <net/dst.h>
@@ -70,6 +71,13 @@ static void ipgre_tunnel_encap_del_mpls_ops(void)
 {
 }
 #endif
+
+static void mpls_route_update(struct net *net, unsigned int index,
+			      struct mpls_route *new,
+			      const struct nl_info *info);
+
+static bool mpls_label_ok(struct net *net, unsigned int *index,
+			  struct netlink_ext_ack *extack);
 
 static void rtmsg_lfib(int event, u32 label, struct mpls_route *rt,
 		       struct nlmsghdr *nlh, struct net *net, u32 portid,
@@ -414,10 +422,6 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 		goto drop;
 	}
 
-	nh = mpls_select_multipath(rt, skb);
-	if (!nh)
-		goto err;
-
 	/* Pop the label */
 	skb_pull(skb, sizeof(*hdr));
 	skb_reset_network_header(skb);
@@ -431,6 +435,17 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 
 	/* Verify ttl is valid */
 	if (dec.ttl <= 1)
+		goto err;
+
+	if (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW) {
+		int ret;
+
+		ret = rt->rt_local_ops->input(skb, dev, rt->rt_local_priv);
+		return ret == 0 ? NET_RX_SUCCESS : NET_RX_DROP;
+	}
+
+	nh = mpls_select_multipath(rt, skb);
+	if (!nh)
 		goto err;
 
 	/* Find the output device */
@@ -554,11 +569,40 @@ static struct mpls_route *mpls_rt_alloc(u8 num_nh, u8 max_alen, u8 max_labels)
 	return rt;
 }
 
+static struct mpls_route *mpls_local_pw_rt_alloc(
+	const struct mpls_local_input_ops *ops, void *priv)
+{
+	struct mpls_route *rt;
+
+	if (!ops || !ops->input || !ops->owner)
+		return ERR_PTR(-EINVAL);
+
+	rt = kzalloc(sizeof(*rt), GFP_KERNEL);
+	if (!rt)
+		return ERR_PTR(-ENOMEM);
+
+	rt->rt_action = MPLS_ROUTE_ACT_LOCAL_PW;
+	rt->rt_local_ops = ops;
+	rt->rt_local_priv = priv;
+	rt->rt_ttl_propagate = MPLS_TTL_PROP_DISABLED;
+
+	return rt;
+}
+
 static void mpls_rt_free_rcu(struct rcu_head *head)
 {
 	struct mpls_route *rt;
 
 	rt = container_of(head, struct mpls_route, rt_rcu);
+
+	if (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW) {
+		if (rt->rt_local_ops && rt->rt_local_ops->release)
+			rt->rt_local_ops->release(rt->rt_local_priv);
+		if (rt->rt_local_ops && rt->rt_local_ops->owner)
+			module_put(rt->rt_local_ops->owner);
+		kfree(rt);
+		return;
+	}
 
 	change_nexthops(rt) {
 		netdev_put(nh->nh_dev, &nh->nh_dev_tracker);
@@ -566,6 +610,62 @@ static void mpls_rt_free_rcu(struct rcu_head *head)
 
 	kfree(rt);
 }
+
+int mpls_local_pw_register(struct net *net, u32 in_label,
+			   const struct mpls_local_input_ops *ops,
+			   void *priv)
+{
+	struct mpls_route __rcu **platform_label;
+	struct mpls_route *old, *rt;
+	unsigned int index = in_label;
+
+	if (!ops || !ops->input || !ops->owner)
+		return -EINVAL;
+
+	ASSERT_RTNL();
+
+	if (!mpls_label_ok(net, &index, NULL))
+		return -EINVAL;
+
+	platform_label = mpls_dereference(net, net->mpls.platform_label);
+	old = mpls_dereference(net, platform_label[index]);
+	if (old)
+		return -EEXIST;
+
+	if (!try_module_get(ops->owner))
+		return -ENODEV;
+
+	rt = mpls_local_pw_rt_alloc(ops, priv);
+	if (IS_ERR(rt)) {
+		module_put(ops->owner);
+		return PTR_ERR(rt);
+	}
+
+	mpls_route_update(net, index, rt, NULL);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mpls_local_pw_register);
+
+void mpls_local_pw_unregister(struct net *net, u32 in_label,
+			      const struct mpls_local_input_ops *ops,
+			      void *priv)
+{
+	struct mpls_route __rcu **platform_label;
+	struct mpls_route *rt;
+	unsigned int index = in_label;
+
+	ASSERT_RTNL();
+
+	if (!mpls_label_ok(net, &index, NULL))
+		return;
+
+	platform_label = mpls_dereference(net, net->mpls.platform_label);
+	rt = mpls_dereference(net, platform_label[index]);
+	if (rt && rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW &&
+	    rt->rt_local_ops == ops && rt->rt_local_priv == priv)
+		mpls_route_update(net, index, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(mpls_local_pw_unregister);
 
 static void mpls_rt_free(struct mpls_route *rt)
 {
