@@ -498,16 +498,12 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 	if (dec.ttl <= 1)
 		goto err;
 
-	/*
- 	* Transitional PW-label binding:
- 	*
-	* The matched local label is now the PW label, but MPW RX still expects
- 	* to see [ PW label ][ CW ][ Ethernet ] and does its own PW-label lookup.
- 	*
- 	* So for now, do NOT pop the matched label before handing to MPW.
- 	*/
 	if (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW) {
 		int ret;
+
+		/* Matched local label is the PW label: pop it before handing to MPW */
+		skb_pull(skb, sizeof(*hdr));
+		skb_reset_network_header(skb);
 
 		ret = rt->rt_local_ops->input(skb, dev, rt->rt_local_priv);
 		return ret == 0 ? NET_RX_SUCCESS : NET_RX_DROP;
