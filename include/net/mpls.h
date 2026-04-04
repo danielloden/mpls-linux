@@ -60,7 +60,6 @@ void mpls_local_pw_unregister(struct net *net, u32 in_label,
 			      void *priv);
 
 struct mpls_pw_egress_info {
-	u32 remote_transport_label;
 	__be32 peer_ipv4;
 	u8 ttl;
 };

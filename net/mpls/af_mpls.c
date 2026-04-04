@@ -23,6 +23,8 @@
 #include <net/ip_tunnels.h>
 #include <net/netns/generic.h>
 #include <net/route.h>
+#include <net/lwtunnel.h>
+#include <net/mpls_iptunnel.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6.h>
 #endif
@@ -167,14 +169,21 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 	struct rtable *rt;
 	struct flowi4 fl4 = {};
 	struct net_device *out_dev;
+	const struct lwtunnel_state *lws;
+	struct mpls_iptunnel_encap *tun_encap_info = NULL;
 	struct mpls_shim_hdr *hdr;
 	__be32 nh_addr;
 	unsigned int hh_len;
-	unsigned int new_header_size;
+	unsigned int new_header_size = 0;
 	unsigned int mtu;
+	unsigned int ttl;
+	unsigned int transport_labels = 0;
+	struct mpls_dev *out_mdev;
 	int err = -EINVAL;
+	bool bos;
+	int i;
 
-	if (!info || !info->remote_transport_label || !info->peer_ipv4)
+	if (!info || !info->peer_ipv4)
 		goto drop;
 
 	fl4.daddr = info->peer_ipv4;
@@ -197,7 +206,21 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 		goto out_rt;
 	}
 
-	new_header_size = sizeof(*hdr);
+	lws = rt->dst.lwtstate;
+	if (lws && lws->type == LWTUNNEL_ENCAP_MPLS) {
+		tun_encap_info = mpls_lwtunnel_encap((struct lwtunnel_state *)lws);
+		transport_labels = tun_encap_info->labels;
+		new_header_size = transport_labels * sizeof(struct mpls_shim_hdr);
+
+		ttl = tun_encap_info->ttl_propagate == MPLS_TTL_PROP_DISABLED &&
+		      tun_encap_info->default_ttl ?
+		      tun_encap_info->default_ttl :
+		      (info->ttl ? info->ttl : 255);
+	} else {
+		/* No route MPLS encap: send PW-label-only */
+		ttl = info->ttl ? info->ttl : 255;
+	}
+
 	mtu = mpls_dev_mtu(out_dev);
 	if (mpls_pkt_too_big(skb, mtu - new_header_size)) {
 		err = -EMSGSIZE;
@@ -206,18 +229,23 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 
 	hh_len = out_dev->header_ops ? LL_RESERVED_SPACE(out_dev) : 0;
 
-	if (skb_cow(skb, hh_len + new_header_size)) {
+	if (skb_cow_head(skb, hh_len + new_header_size)) {
 		err = -ENOMEM;
 		goto out_rt;
 	}
 
-	skb_push(skb, sizeof(*hdr));
-	skb_reset_network_header(skb);
+	if (transport_labels) {
+		skb_push(skb, new_header_size);
+		skb_reset_network_header(skb);
 
-	hdr = mpls_hdr(skb);
-	*hdr = mpls_entry_encode(info->remote_transport_label,
-				 info->ttl ? info->ttl : 255,
-				 0, false);
+		hdr = mpls_hdr(skb);
+		bos = false; /* PW label already below us is BOS */
+		for (i = transport_labels - 1; i >= 0; i--) {
+			hdr[i] = mpls_entry_encode(tun_encap_info->label[i],
+						   ttl, 0, bos);
+			bos = false;
+		}
+	}
 
 	skb->dev = out_dev;
 	skb->protocol = htons(ETH_P_MPLS_UC);
@@ -233,6 +261,9 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 out_rt:
 	ip_rt_put(rt);
 drop:
+	out_mdev = out_dev ? mpls_dev_rcu(out_dev) : NULL;
+	if (out_mdev)
+		MPLS_INC_STATS(out_mdev, tx_errors);
 	kfree_skb(skb);
 	return err;
 }
