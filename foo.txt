@@ -1,0 +1,103 @@
+[1mdiff --git a/include/net/mpls.h b/include/net/mpls.h[m
+[1mindex f68439969..34712a789 100644[m
+[1m--- a/include/net/mpls.h[m
+[1m+++ b/include/net/mpls.h[m
+[36m@@ -62,7 +62,6 @@[m [mvoid mpls_local_pw_unregister(struct net *net, u32 in_label,[m
+ struct mpls_pw_egress_info {[m
+ 	u32 remote_transport_label;[m
+ 	__be32 peer_ipv4;[m
+[31m-	u32 oif;[m
+ 	u8 ttl;[m
+ };[m
+ [m
+[1mdiff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c[m
+[1mindex 4f79b15f3..d8d9a2cbf 100644[m
+[1m--- a/net/mpls/af_mpls.c[m
+[1m+++ b/net/mpls/af_mpls.c[m
+[36m@@ -22,6 +22,7 @@[m
+ #include <net/netevent.h>[m
+ #include <net/ip_tunnels.h>[m
+ #include <net/netns/generic.h>[m
+[32m+[m[32m#include <net/route.h>[m
+ #if IS_ENABLED(CONFIG_IPV6)[m
+ #include <net/ipv6.h>[m
+ #endif[m
+[36m@@ -163,40 +164,51 @@[m [mEXPORT_SYMBOL_GPL(mpls_pkt_too_big);[m
+ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,[m
+ 		 const struct mpls_pw_egress_info *info)[m
+ {[m
+[31m-	struct net_device *out_dev = NULL;[m
+[32m+[m	[32mstruct rtable *rt;[m
+[32m+[m	[32mstruct flowi4 fl4 = {};[m
+[32m+[m	[32mstruct net_device *out_dev;[m
+ 	struct mpls_shim_hdr *hdr;[m
+[32m+[m	[32m__be32 nh_addr;[m
+ 	unsigned int hh_len;[m
+ 	unsigned int new_header_size;[m
+ 	unsigned int mtu;[m
+ 	int err = -EINVAL;[m
+ [m
+[31m-	if (!info || !info->remote_transport_label || !info->peer_ipv4 ||[m
+[31m-	    !info->oif)[m
+[32m+[m	[32mif (!info || !info->remote_transport_label || !info->peer_ipv4)[m
+ 		goto drop;[m
+ [m
+[31m-	out_dev = dev_get_by_index(net, info->oif);[m
+[32m+[m	[32mfl4.daddr = info->peer_ipv4;[m
+[32m+[m	[32mfl4.flowi4_scope = RT_SCOPE_UNIVERSE;[m
+[32m+[m
+[32m+[m	[32mrt = ip_route_output_key(net, &fl4);[m
+[32m+[m	[32mif (IS_ERR(rt)) {[m
+[32m+[m		[32merr = PTR_ERR(rt);[m
+[32m+[m		[32mgoto drop;[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mout_dev = rt->dst.dev;[m
+ 	if (!out_dev) {[m
+ 		err = -ENODEV;[m
+[31m-		goto drop;[m
+[32m+[m		[32mgoto out_rt;[m
+ 	}[m
+ [m
+ 	if (!mpls_output_possible(out_dev)) {[m
+ 		err = -ENETDOWN;[m
+[31m-		goto out_dev;[m
+[32m+[m		[32mgoto out_rt;[m
+ 	}[m
+ [m
+ 	new_header_size = sizeof(*hdr);[m
+ 	mtu = mpls_dev_mtu(out_dev);[m
+ 	if (mpls_pkt_too_big(skb, mtu - new_header_size)) {[m
+ 		err = -EMSGSIZE;[m
+[31m-		goto out_dev;[m
+[32m+[m		[32mgoto out_rt;[m
+ 	}[m
+ [m
+ 	hh_len = out_dev->header_ops ? LL_RESERVED_SPACE(out_dev) : 0;[m
+ [m
+ 	if (skb_cow(skb, hh_len + new_header_size)) {[m
+ 		err = -ENOMEM;[m
+[31m-		goto out_dev;[m
+[32m+[m		[32mgoto out_rt;[m
+ 	}[m
+ [m
+ 	skb_push(skb, sizeof(*hdr));[m
+[36m@@ -212,13 +224,14 @@[m [mint mpls_pw_xmit(struct net *net, struct sk_buff *skb,[m
+ [m
+ 	mpls_stats_inc_outucastpkts(net, out_dev, skb);[m
+ [m
+[31m-	err = neigh_xmit(NEIGH_ARP_TABLE, out_dev, &info->peer_ipv4, skb);[m
+[31m-	dev_put(out_dev);[m
+[32m+[m	[32mnh_addr = rt_nexthop(rt, info->peer_ipv4);[m
+[32m+[m	[32merr = neigh_xmit(NEIGH_ARP_TABLE, out_dev, &nh_addr, skb);[m
+ [m
+[32m+[m	[32mip_rt_put(rt);[m
+ 	return err;[m
+ [m
+[31m-out_dev:[m
+[31m-	dev_put(out_dev);[m
+[32m+[m[32mout_rt:[m
+[32m+[m	[32mip_rt_put(rt);[m
+ drop:[m
+ 	kfree_skb(skb);[m
+ 	return err;[m

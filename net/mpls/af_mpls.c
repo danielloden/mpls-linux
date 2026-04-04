@@ -22,6 +22,7 @@
 #include <net/netevent.h>
 #include <net/ip_tunnels.h>
 #include <net/netns/generic.h>
+#include <net/route.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6.h>
 #endif
@@ -163,40 +164,51 @@ EXPORT_SYMBOL_GPL(mpls_pkt_too_big);
 int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 		 const struct mpls_pw_egress_info *info)
 {
-	struct net_device *out_dev = NULL;
+	struct rtable *rt;
+	struct flowi4 fl4 = {};
+	struct net_device *out_dev;
 	struct mpls_shim_hdr *hdr;
+	__be32 nh_addr;
 	unsigned int hh_len;
 	unsigned int new_header_size;
 	unsigned int mtu;
 	int err = -EINVAL;
 
-	if (!info || !info->remote_transport_label || !info->peer_ipv4 ||
-	    !info->oif)
+	if (!info || !info->remote_transport_label || !info->peer_ipv4)
 		goto drop;
 
-	out_dev = dev_get_by_index(net, info->oif);
+	fl4.daddr = info->peer_ipv4;
+	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+
+	rt = ip_route_output_key(net, &fl4);
+	if (IS_ERR(rt)) {
+		err = PTR_ERR(rt);
+		goto drop;
+	}
+
+	out_dev = rt->dst.dev;
 	if (!out_dev) {
 		err = -ENODEV;
-		goto drop;
+		goto out_rt;
 	}
 
 	if (!mpls_output_possible(out_dev)) {
 		err = -ENETDOWN;
-		goto out_dev;
+		goto out_rt;
 	}
 
 	new_header_size = sizeof(*hdr);
 	mtu = mpls_dev_mtu(out_dev);
 	if (mpls_pkt_too_big(skb, mtu - new_header_size)) {
 		err = -EMSGSIZE;
-		goto out_dev;
+		goto out_rt;
 	}
 
 	hh_len = out_dev->header_ops ? LL_RESERVED_SPACE(out_dev) : 0;
 
 	if (skb_cow(skb, hh_len + new_header_size)) {
 		err = -ENOMEM;
-		goto out_dev;
+		goto out_rt;
 	}
 
 	skb_push(skb, sizeof(*hdr));
@@ -212,13 +224,14 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 
 	mpls_stats_inc_outucastpkts(net, out_dev, skb);
 
-	err = neigh_xmit(NEIGH_ARP_TABLE, out_dev, &info->peer_ipv4, skb);
-	dev_put(out_dev);
+	nh_addr = rt_nexthop(rt, info->peer_ipv4);
+	err = neigh_xmit(NEIGH_ARP_TABLE, out_dev, &nh_addr, skb);
 
+	ip_rt_put(rt);
 	return err;
 
-out_dev:
-	dev_put(out_dev);
+out_rt:
+	ip_rt_put(rt);
 drop:
 	kfree_skb(skb);
 	return err;
