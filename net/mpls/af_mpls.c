@@ -160,6 +160,71 @@ bool mpls_pkt_too_big(const struct sk_buff *skb, unsigned int mtu)
 }
 EXPORT_SYMBOL_GPL(mpls_pkt_too_big);
 
+int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
+		 const struct mpls_pw_egress_info *info)
+{
+	struct net_device *out_dev = NULL;
+	struct mpls_shim_hdr *hdr;
+	unsigned int hh_len;
+	unsigned int new_header_size;
+	unsigned int mtu;
+	int err = -EINVAL;
+
+	if (!info || !info->remote_transport_label || !info->peer_ipv4 ||
+	    !info->oif)
+		goto drop;
+
+	out_dev = dev_get_by_index(net, info->oif);
+	if (!out_dev) {
+		err = -ENODEV;
+		goto drop;
+	}
+
+	if (!mpls_output_possible(out_dev)) {
+		err = -ENETDOWN;
+		goto out_dev;
+	}
+
+	new_header_size = sizeof(*hdr);
+	mtu = mpls_dev_mtu(out_dev);
+	if (mpls_pkt_too_big(skb, mtu - new_header_size)) {
+		err = -EMSGSIZE;
+		goto out_dev;
+	}
+
+	hh_len = out_dev->header_ops ? LL_RESERVED_SPACE(out_dev) : 0;
+
+	if (skb_cow(skb, hh_len + new_header_size)) {
+		err = -ENOMEM;
+		goto out_dev;
+	}
+
+	skb_push(skb, sizeof(*hdr));
+	skb_reset_network_header(skb);
+
+	hdr = mpls_hdr(skb);
+	*hdr = mpls_entry_encode(info->remote_transport_label,
+				 info->ttl ? info->ttl : 255,
+				 0, false);
+
+	skb->dev = out_dev;
+	skb->protocol = htons(ETH_P_MPLS_UC);
+
+	mpls_stats_inc_outucastpkts(net, out_dev, skb);
+
+	err = neigh_xmit(NEIGH_ARP_TABLE, out_dev, &info->peer_ipv4, skb);
+	dev_put(out_dev);
+
+	return err;
+
+out_dev:
+	dev_put(out_dev);
+drop:
+	kfree_skb(skb);
+	return err;
+}
+EXPORT_SYMBOL_GPL(mpls_pw_xmit);
+
 void mpls_stats_inc_outucastpkts(struct net *net,
 				 struct net_device *dev,
 				 const struct sk_buff *skb)
@@ -422,10 +487,6 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 		goto drop;
 	}
 
-	/* Pop the label */
-	skb_pull(skb, sizeof(*hdr));
-	skb_reset_network_header(skb);
-
 	skb_orphan(skb);
 
 	if (skb_warn_if_lro(skb))
@@ -437,12 +498,24 @@ static int mpls_forward(struct sk_buff *skb, struct net_device *dev,
 	if (dec.ttl <= 1)
 		goto err;
 
+	/*
+ 	* Transitional PW-label binding:
+ 	*
+	* The matched local label is now the PW label, but MPW RX still expects
+ 	* to see [ PW label ][ CW ][ Ethernet ] and does its own PW-label lookup.
+ 	*
+ 	* So for now, do NOT pop the matched label before handing to MPW.
+ 	*/
 	if (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW) {
 		int ret;
 
 		ret = rt->rt_local_ops->input(skb, dev, rt->rt_local_priv);
 		return ret == 0 ? NET_RX_SUCCESS : NET_RX_DROP;
 	}
+
+	/* Forwarding path still pops the label */
+	skb_pull(skb, sizeof(*hdr));
+	skb_reset_network_header(skb);
 
 	nh = mpls_select_multipath(rt, skb);
 	if (!nh)
