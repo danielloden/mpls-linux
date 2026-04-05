@@ -47,6 +47,7 @@ static inline struct mpls_shim_hdr mpls_entry_encode(u32 label,
 struct mpls_local_input_ops {
 	int (*input)(struct sk_buff *skb, struct net_device *ingress_dev,
 		     void *priv);
+	int (*dump_info)(struct sk_buff *skb, void *priv);
 	void (*release)(void *priv);
 	struct module *owner;
 };

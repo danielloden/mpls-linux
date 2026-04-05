@@ -2350,6 +2350,13 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 		nla_nest_end(skb, mp);
 	}
 
+	if (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW &&
+	    rt->rt_local_ops &&
+	    rt->rt_local_ops->dump_info) {
+		if (rt->rt_local_ops->dump_info(skb, rt->rt_local_priv))
+			goto nla_put_failure;
+	}
+
 	nlmsg_end(skb, nlh);
 	return 0;
 
@@ -2534,6 +2541,10 @@ static inline size_t lfib_nlmsg_size(struct mpls_route *rt)
 		/* nested attribute */
 		payload += nla_total_size(nhsize);
 	}
+	if (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW &&
+	    rt->rt_local_ops &&
+	    rt->rt_local_ops->dump_info)
+		payload += nla_total_size(sizeof(u32)); /* extra RTA_OIF */
 
 	return payload;
 }
