@@ -697,7 +697,8 @@ static struct mpls_route *mpls_local_pw_rt_alloc(
 	rt->rt_action = MPLS_ROUTE_ACT_LOCAL_PW;
 	rt->rt_local_ops = ops;
 	rt->rt_local_priv = priv;
-	rt->rt_ttl_propagate = MPLS_TTL_PROP_DISABLED;
+	rt->rt_protocol = RTPROT_STATIC;
+	rt->rt_ttl_propagate = MPLS_TTL_PROP_DEFAULT;
 
 	return rt;
 }
@@ -2267,7 +2268,8 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 	rtm->rtm_table = RT_TABLE_MAIN;
 	rtm->rtm_protocol = rt->rt_protocol;
 	rtm->rtm_scope = RT_SCOPE_UNIVERSE;
-	rtm->rtm_type = RTN_UNICAST;
+	rtm->rtm_type = (rt->rt_action == MPLS_ROUTE_ACT_LOCAL_PW) ?
+			RTN_LOCAL : RTN_UNICAST;
 	rtm->rtm_flags = 0;
 
 	if (nla_put_labels(skb, RTA_DST, 1, &label))
@@ -2277,10 +2279,10 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 		bool ttl_propagate =
 			rt->rt_ttl_propagate == MPLS_TTL_PROP_ENABLED;
 
-		if (nla_put_u8(skb, RTA_TTL_PROPAGATE,
-			       ttl_propagate))
+		if (nla_put_u8(skb, RTA_TTL_PROPAGATE, ttl_propagate))
 			goto nla_put_failure;
 	}
+
 	if (rt->rt_nhn == 1) {
 		const struct mpls_nh *nh = rt->rt_nh;
 
@@ -2288,17 +2290,22 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 		    nla_put_labels(skb, RTA_NEWDST, nh->nh_labels,
 				   nh->nh_label))
 			goto nla_put_failure;
+
 		if (nh->nh_via_table != MPLS_NEIGH_TABLE_UNSPEC &&
 		    nla_put_via(skb, nh->nh_via_table, mpls_nh_via(rt, nh),
 				nh->nh_via_alen))
 			goto nla_put_failure;
+
 		dev = nh->nh_dev;
 		if (dev && nla_put_u32(skb, RTA_OIF, dev->ifindex))
 			goto nla_put_failure;
-		if (nh->nh_flags & RTNH_F_LINKDOWN)
-			rtm->rtm_flags |= RTNH_F_LINKDOWN;
-		if (nh->nh_flags & RTNH_F_DEAD)
-			rtm->rtm_flags |= RTNH_F_DEAD;
+
+		if (rt->rt_action != MPLS_ROUTE_ACT_LOCAL_PW) {
+			if (nh->nh_flags & RTNH_F_LINKDOWN)
+				rtm->rtm_flags |= RTNH_F_LINKDOWN;
+			if (nh->nh_flags & RTNH_F_DEAD)
+				rtm->rtm_flags |= RTNH_F_DEAD;
+		}
 	} else {
 		struct rtnexthop *rtnh;
 		struct nlattr *mp;
@@ -2319,19 +2326,23 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 				goto nla_put_failure;
 
 			rtnh->rtnh_ifindex = dev->ifindex;
-			if (nh->nh_flags & RTNH_F_LINKDOWN) {
-				rtnh->rtnh_flags |= RTNH_F_LINKDOWN;
-				linkdown++;
-			}
-			if (nh->nh_flags & RTNH_F_DEAD) {
-				rtnh->rtnh_flags |= RTNH_F_DEAD;
-				dead++;
+
+			if (rt->rt_action != MPLS_ROUTE_ACT_LOCAL_PW) {
+				if (nh->nh_flags & RTNH_F_LINKDOWN) {
+					rtnh->rtnh_flags |= RTNH_F_LINKDOWN;
+					linkdown++;
+				}
+				if (nh->nh_flags & RTNH_F_DEAD) {
+					rtnh->rtnh_flags |= RTNH_F_DEAD;
+					dead++;
+				}
 			}
 
-			if (nh->nh_labels && nla_put_labels(skb, RTA_NEWDST,
-							    nh->nh_labels,
-							    nh->nh_label))
+			if (nh->nh_labels &&
+			    nla_put_labels(skb, RTA_NEWDST, nh->nh_labels,
+					   nh->nh_label))
 				goto nla_put_failure;
+
 			if (nh->nh_via_table != MPLS_NEIGH_TABLE_UNSPEC &&
 			    nla_put_via(skb, nh->nh_via_table,
 					mpls_nh_via(rt, nh),
@@ -2342,10 +2353,12 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
 			rtnh->rtnh_len = nlmsg_get_pos(skb) - (void *)rtnh;
 		} endfor_nexthops(rt);
 
-		if (linkdown == rt->rt_nhn)
-			rtm->rtm_flags |= RTNH_F_LINKDOWN;
-		if (dead == rt->rt_nhn)
-			rtm->rtm_flags |= RTNH_F_DEAD;
+		if (rt->rt_action != MPLS_ROUTE_ACT_LOCAL_PW) {
+			if (linkdown == rt->rt_nhn)
+				rtm->rtm_flags |= RTNH_F_LINKDOWN;
+			if (dead == rt->rt_nhn)
+				rtm->rtm_flags |= RTNH_F_DEAD;
+		}
 
 		nla_nest_end(skb, mp);
 	}
