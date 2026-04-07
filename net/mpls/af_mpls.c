@@ -23,6 +23,8 @@
 #include <net/ip_tunnels.h>
 #include <net/netns/generic.h>
 #include <net/route.h>
+#include <net/ip6_route.h>
+#include <net/ndisc.h>
 #include <net/lwtunnel.h>
 #include <net/mpls_iptunnel.h>
 #if IS_ENABLED(CONFIG_IPV6)
@@ -166,13 +168,17 @@ EXPORT_SYMBOL_GPL(mpls_pkt_too_big);
 int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 		 const struct mpls_pw_egress_info *info)
 {
-	struct rtable *rt;
 	struct flowi4 fl4 = {};
-	struct net_device *out_dev;
+	struct dst_entry *dst = NULL;
+	struct net_device *out_dev = NULL;
 	const struct lwtunnel_state *lws;
 	struct mpls_iptunnel_encap *tun_encap_info = NULL;
 	struct mpls_shim_hdr *hdr;
-	__be32 nh_addr;
+	int neigh_tbl = -1;
+	union {
+		__be32 ipv4;
+		struct in6_addr ipv6;
+	} nh_addr;
 	unsigned int hh_len;
 	unsigned int new_header_size = 0;
 	unsigned int mtu;
@@ -183,30 +189,72 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 	bool bos;
 	int i;
 
-	if (!info || !info->peer_ipv4)
+	if (!info)
 		goto drop;
 
-	fl4.daddr = info->peer_ipv4;
-	fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+	switch (info->peer_af) {
+	case AF_INET: {
+		struct rtable *rt;
 
-	rt = ip_route_output_key(net, &fl4);
-	if (IS_ERR(rt)) {
-		err = PTR_ERR(rt);
+		if (!info->peer_addr.ipv4) {
+			err = -EINVAL;
+			goto drop;
+		}
+
+		fl4.daddr = info->peer_addr.ipv4;
+		fl4.flowi4_scope = RT_SCOPE_UNIVERSE;
+
+		rt = ip_route_output_key(net, &fl4);
+		if (IS_ERR(rt)) {
+			err = PTR_ERR(rt);
+			goto drop;
+		}
+
+		dst = &rt->dst;
+		out_dev = dst->dev;
+		nh_addr.ipv4 = rt_nexthop(rt, info->peer_addr.ipv4);
+		neigh_tbl = NEIGH_ARP_TABLE;
+		break;
+	}
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6: {
+		struct flowi6 fl6 = {};
+		const struct in6_addr *nh6;
+
+		fl6.daddr = info->peer_addr.ipv6;
+		dst = ip6_route_output(net, NULL, &fl6);
+		if (!dst) {
+			err = -EHOSTUNREACH;
+			goto drop;
+		}
+		if (dst->error) {
+			err = dst->error;
+			goto out_dst;
+		}
+
+		out_dev = dst->dev;
+		nh6 = rt6_nexthop((struct rt6_info *)dst, &fl6.daddr);
+		nh_addr.ipv6 = *nh6;
+		neigh_tbl = NEIGH_ND_TABLE;
+		break;
+	}
+#endif
+	default:
+		err = -EAFNOSUPPORT;
 		goto drop;
 	}
 
-	out_dev = rt->dst.dev;
 	if (!out_dev) {
 		err = -ENODEV;
-		goto out_rt;
+		goto out_dst;
 	}
 
 	if (!mpls_output_possible(out_dev)) {
 		err = -ENETDOWN;
-		goto out_rt;
+		goto out_dst;
 	}
 
-	lws = rt->dst.lwtstate;
+	lws = dst->lwtstate;
 	if (lws && lws->type == LWTUNNEL_ENCAP_MPLS) {
 		tun_encap_info = mpls_lwtunnel_encap((struct lwtunnel_state *)lws);
 		transport_labels = tun_encap_info->labels;
@@ -224,14 +272,14 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 	mtu = mpls_dev_mtu(out_dev);
 	if (mpls_pkt_too_big(skb, mtu - new_header_size)) {
 		err = -EMSGSIZE;
-		goto out_rt;
+		goto out_dst;
 	}
 
 	hh_len = out_dev->header_ops ? LL_RESERVED_SPACE(out_dev) : 0;
 
 	if (skb_cow_head(skb, hh_len + new_header_size)) {
 		err = -ENOMEM;
-		goto out_rt;
+		goto out_dst;
 	}
 
 	if (transport_labels) {
@@ -252,14 +300,17 @@ int mpls_pw_xmit(struct net *net, struct sk_buff *skb,
 
 	mpls_stats_inc_outucastpkts(net, out_dev, skb);
 
-	nh_addr = rt_nexthop(rt, info->peer_ipv4);
-	err = neigh_xmit(NEIGH_ARP_TABLE, out_dev, &nh_addr, skb);
+	if (neigh_tbl == NEIGH_ARP_TABLE)
+		err = neigh_xmit(neigh_tbl, out_dev, &nh_addr.ipv4, skb);
+	else
+		err = neigh_xmit(neigh_tbl, out_dev, &nh_addr.ipv6, skb);
 
-	ip_rt_put(rt);
+	dst_release(dst);
 	return err;
 
-out_rt:
-	ip_rt_put(rt);
+out_dst:
+	if (dst)
+		dst_release(dst);
 drop:
 	out_mdev = out_dev ? mpls_dev_rcu(out_dev) : NULL;
 	if (out_mdev)

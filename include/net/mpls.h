@@ -11,6 +11,9 @@
 #include <linux/mpls.h>
 #include <linux/skbuff.h>
 #include <linux/module.h>
+#include <linux/in.h>
+#include <linux/in6.h>
+#include <linux/socket.h>
 
 #define MPLS_HLEN 4
 
@@ -61,7 +64,11 @@ void mpls_local_pw_unregister(struct net *net, u32 in_label,
 			      void *priv);
 
 struct mpls_pw_egress_info {
-	__be32 peer_ipv4;
+	u16 peer_af;
+	union {
+		__be32 ipv4;
+		struct in6_addr ipv6;
+	} peer_addr;
 	u8 ttl;
 };
 
